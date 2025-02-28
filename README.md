@@ -3,5 +3,5 @@ This program combines both and allows for a Window's user to operate their compu
 
 Packages used: Numpy, Pyautogui, OpenCV, Mediapipe, Scikit
 
-Currently work is being done to shift primary operation to the eyes (for switching windows, and clicking on objects). The program does not require an extremely high quality program but it can help, the user should also make sure the background is well lit. 
+Currently work is being done to shift primary operation to the eyes (for switching windows, and clicking on objects). The program does not require an extremely high quality camera but it can help, the user should also make sure the background is well lit. 
 
