@@ -37,6 +37,8 @@ class GestureController:
         min_detection_confidence: float = 0.6,
         min_tracking_confidence: float = 0.5,
         activation_frames: int = 3,
+        processing_width: int = 512,
+        process_every_n_frames: int = 2,
     ):
         self.dominant_hand = dominant_hand.capitalize()
         self.activation_frames = max(1, int(activation_frames))
@@ -45,6 +47,13 @@ class GestureController:
         self._candidate_frames = 0
         self._stable_label = "NONE"
         self._scroll_anchor_y = None
+        self.processing_width = max(256, int(processing_width))
+        self.process_every_n_frames = max(1, int(process_every_n_frames))
+        self._frame_index = 0
+        self._cached_label = "NONE"
+        self._cached_handedness = None
+        self._cached_landmarks: list[tuple[int, int]] = []
+        self._cached_drag_active = False
 
         if not HAND_LANDMARKER_MODEL.exists():
             raise FileNotFoundError(
@@ -64,12 +73,12 @@ class GestureController:
         self._timestamp_ms = 0
 
     def _distance(self, hand_landmarks, first_index: int, second_index: int) -> float:
-        first = hand_landmarks.landmark[first_index]
-        second = hand_landmarks.landmark[second_index]
+        first = hand_landmarks[first_index]
+        second = hand_landmarks[second_index]
         return math.hypot(first.x - second.x, first.y - second.y)
 
     def _finger_states(self, hand_landmarks, handedness: str) -> dict[str, bool]:
-        landmarks = hand_landmarks.landmark
+        landmarks = hand_landmarks
         thumb_extended = (
             landmarks[THUMB_TIP].x < landmarks[THUMB_IP].x
             if handedness == "Right"
@@ -131,12 +140,34 @@ class GestureController:
 
     def _landmarks_to_pixels(self, hand_landmarks, width: int, height: int) -> list[tuple[int, int]]:
         pixels = []
-        for landmark in hand_landmarks.landmark:
+        for landmark in hand_landmarks:
             pixels.append((int(landmark.x * width), int(landmark.y * height)))
         return pixels
 
+    def _cached_frame(self) -> GestureFrame:
+        return GestureFrame(
+            label=self._cached_label,
+            handedness=self._cached_handedness,
+            landmarks=list(self._cached_landmarks),
+            drag_active=self._cached_drag_active,
+        )
+
+    def _update_cache(self, gesture_frame: GestureFrame) -> None:
+        self._cached_label = gesture_frame.label
+        self._cached_handedness = gesture_frame.handedness
+        self._cached_landmarks = list(gesture_frame.landmarks)
+        self._cached_drag_active = gesture_frame.drag_active
+
     def process(self, frame) -> GestureFrame:
+        self._frame_index += 1
+        if self.process_every_n_frames > 1 and self._frame_index % self.process_every_n_frames != 1:
+            return self._cached_frame()
+
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        height, width = frame.shape[:2]
+        if width > self.processing_width:
+            processing_height = max(1, int(round(height * self.processing_width / width)))
+            rgb = cv2.resize(rgb, (self.processing_width, processing_height), interpolation=cv2.INTER_AREA)
         image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         now_ms = int(time.monotonic() * 1000)
         self._timestamp_ms = max(self._timestamp_ms + 1, now_ms)
@@ -147,7 +178,9 @@ class GestureController:
             label, changed = self._stabilize("NONE")
             if changed:
                 self._scroll_anchor_y = None
-            return GestureFrame(label=label)
+            gesture_frame = GestureFrame(label=label)
+            self._update_cache(gesture_frame)
+            return gesture_frame
 
         raw_label = self._classify(hand_landmarks, handedness)
         label, changed = self._stabilize(raw_label)
@@ -168,7 +201,7 @@ class GestureController:
                 self._scroll_anchor_y = None
 
         if label == "PINCH":
-            current_y = hand_landmarks.landmark[INDEX_TIP].y
+            current_y = hand_landmarks[INDEX_TIP].y
             if self._scroll_anchor_y is None:
                 self._scroll_anchor_y = current_y
             delta = self._scroll_anchor_y - current_y
@@ -178,6 +211,7 @@ class GestureController:
         else:
             self._scroll_anchor_y = None
 
+        self._update_cache(gesture_frame)
         return gesture_frame
 
     def apply_actions(self, gesture_frame: GestureFrame, mouse_controller) -> None:

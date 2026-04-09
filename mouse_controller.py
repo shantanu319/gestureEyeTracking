@@ -11,6 +11,7 @@ class MouseController:
         self.dragging = False
         self._pyautogui = None
         self.screen_size = (1280, 720)
+        self._last_target: Optional[tuple[int, int]] = None
 
         try:
             import pyautogui
@@ -65,6 +66,9 @@ class MouseController:
 
     def move_to(self, x: float, y: float) -> bool:
         target = self._clamp_point(x, y)
+        if target == self._last_target:
+            return True
+        self._last_target = target
         return self._call("moveTo", *target)
 
     def click(self) -> bool:

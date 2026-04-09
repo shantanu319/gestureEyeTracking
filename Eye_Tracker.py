@@ -28,6 +28,7 @@ class EyeTracker:
         self,
         min_detection_confidence: float = 0.5,
         min_tracking_confidence: float = 0.5,
+        processing_width: int = 640,
     ):
         if not FACE_LANDMARKER_MODEL.exists():
             raise FileNotFoundError(
@@ -46,6 +47,7 @@ class EyeTracker:
         self._mesh = vision.FaceLandmarker.create_from_options(options)
         self.last_observation: GazeObservation | None = None
         self._timestamp_ms = 0
+        self.processing_width = max(320, int(processing_width))
 
     def _landmark_to_pixel(self, landmark, width: int, height: int) -> tuple[int, int]:
         x = int(min(max(landmark.x * width, 0), width - 1))
@@ -93,6 +95,9 @@ class EyeTracker:
     def process(self, frame) -> GazeObservation | None:
         height, width = frame.shape[:2]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        if width > self.processing_width:
+            processing_height = max(1, int(round(height * self.processing_width / width)))
+            rgb = cv2.resize(rgb, (self.processing_width, processing_height), interpolation=cv2.INTER_AREA)
         image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         now_ms = int(time.monotonic() * 1000)
         self._timestamp_ms = max(self._timestamp_ms + 1, now_ms)
