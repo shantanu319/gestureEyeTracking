@@ -1,244 +1,205 @@
+from __future__ import annotations
+
+import json
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+
 import cv2
-import time
-import collections
 import numpy as np
-from sklearn.linear_model import LinearRegression
-
-FRAME_WIDTH = 640
-FRAME_HEIGHT = 480
 
 
-class Calibration:
+class CalibrationError(RuntimeError):
+    pass
 
+
+@dataclass
+class CalibrationSample:
+    target: tuple[int, int]
+    feature_vector: np.ndarray
+
+
+class CalibrationModel:
     def __init__(self):
-        self.reg = LinearRegression()
-        self.x_reg = LinearRegression()
-        self.y_reg = LinearRegression()
-        self.t_x = None
-        self.t_y = None
-        self.m_x = None
-        self.m_y = None
+        self.coefficients: np.ndarray | None = None
+        self.feature_count: int = 0
 
-    def update(self, data):
-        # pair-wise linear regression
+    @property
+    def is_fitted(self) -> bool:
+        return self.coefficients is not None
 
-        all_v = np.empty((0, 2))
-        all_p = np.empty((0, 2))
-        for point, vectors in data.items():
-            v = np.array(vectors)
-            mean = np.mean(v, axis=0)
-            std = np.std(v, axis=0)
-            filtered_v = [[v[0], v[1]] for v in vectors if v[0] > mean[0] - 2 * std[0] and v[1] > mean[1] - 2 * std[1]]
-            filtered_v = [[v[0], v[1]] for v in filtered_v if
-                          v[0] < mean[0] + 2 * std[0] and v[1] < mean[1] + 2 * std[1]]
+    def _design_matrix(self, features: np.ndarray) -> np.ndarray:
+        features = np.atleast_2d(np.asarray(features, dtype=np.float64))
+        intercept = np.ones((features.shape[0], 1), dtype=np.float64)
+        return np.concatenate((intercept, features), axis=1)
 
-            v = np.array(filtered_v)
-            p = np.full(v.shape, [point])
+    def _filter_samples(self, samples: list[CalibrationSample]) -> list[CalibrationSample]:
+        grouped_samples: dict[tuple[int, int], list[CalibrationSample]] = defaultdict(list)
+        for sample in samples:
+            grouped_samples[sample.target].append(sample)
 
-            all_v = np.concatenate((all_v, v))
-            all_p = np.concatenate((all_p, p))
+        filtered: list[CalibrationSample] = []
+        for group in grouped_samples.values():
+            features = np.asarray([sample.feature_vector for sample in group], dtype=np.float64)
+            if len(group) < 4:
+                filtered.extend(group)
+                continue
 
-        self.reg.fit(all_v, all_p)
-        print("SCORE: {}".format(self.reg.score(all_v, all_p)))
-        print("COEFF: {}".format(self.reg.coef_))
+            median = np.median(features, axis=0)
+            mad = np.median(np.abs(features - median), axis=0)
+            mad[mad < 1e-6] = 1e-6
+            keep_mask = np.all(np.abs(features - median) <= 6.0 * mad, axis=1)
+            kept = [sample for sample, keep in zip(group, keep_mask) if keep]
+            filtered.extend(kept if kept else group)
 
-    #        # linear regression
-    #        all_x_v = np.empty((0,1))
-    #        all_y_v = np.empty((0,1))
-    #        all_x_p = np.empty((0,1))
-    #        all_y_p = np.empty((0,1))
-    #        for point, vectors in data.items():
-    #
-    #            v = np.array(vectors)
-    #            mean = np.mean(v, axis=0)
-    #            std = np.std(v, axis=0)
-    #            filtered_v = [ [v[0], v[1]] for v in vectors if v[0] > mean[0] - 2 * std[0] and v[1] > mean[1] - 2 * std[1] ]
-    #            filtered_v = [ [v[0], v[1]] for v in filtered_v if v[0] < mean[0] + 2 * std[0] and v[1] < mean[1] + 2 * std[1] ]
-    #
-    #            x_v = np.array([ [v[0]] for v in filtered_v ])
-    #            y_v = np.array([ [v[1]] for v in filtered_v ])
-    #
-    #            x_p = np.full(x_v.shape, [point[0]])
-    #            y_p = np.full(y_v.shape, [point[1]])
-    #
-    #            all_x_v = np.concatenate((all_x_v, x_v))
-    #            all_y_v = np.concatenate((all_y_v, y_v))
-    #            all_x_p = np.concatenate((all_x_p, x_p))
-    #            all_y_p = np.concatenate((all_y_p, y_p))
-    #
-    #        self.x_reg.fit(all_x_v, all_x_p)
-    #        self.y_reg.fit(all_y_v, all_y_p)
-    #
-    #        print("SCORE X: {}".format(self.x_reg.score(all_x_v, all_x_p)))
-    #        print("COEFF X: {}".format(self.x_reg.coef_))
-    #        print("SCORE Y: {}".format(self.y_reg.score(all_y_v, all_y_p)))
-    #        print("COEFF Y: {}".format(self.y_reg.coef_))
+        return filtered
 
-    # manual linear regression
-    #        self.t_x = list(data.keys())[0][0]
-    #        self.t_y = list(data.keys())[0][1]
-    #        m_x = []
-    #        m_y = []
-    #
-    #        for point, vectors in data.items():
-    #            mean = np.mean(vectors, axis=0)
-    #            m_x.append(point[0] / median[0])
-    #            m_y.append(point[1] / median[1])
-    #        self.m_x = sum(m_x) / len(m_x)
-    #        self.m_y = sum(m_y) / len(m_y)
+    def fit(self, samples: list[CalibrationSample]) -> int:
+        if len(samples) < 3:
+            raise ValueError("At least three calibration samples are required.")
 
-    def compute(self, vector):
-        # pair-wise linear regression
-        np_vector = np.array([vector])
-        np_gaze = self.reg.predict(np_vector)
-        output = (int(np_gaze[0][0]), int(np_gaze[0][1]))
+        filtered = self._filter_samples(samples)
+        features = np.asarray([sample.feature_vector for sample in filtered], dtype=np.float64)
+        targets = np.asarray([sample.target for sample in filtered], dtype=np.float64)
 
-        # linear regression
-        #        x_vector = np.array([[vector[0]]])
-        #        x_out = self.x_reg.predict(x_vector)
-        #        y_vector = np.array([[vector[1]]])
-        #        y_out = self.y_reg.predict(y_vector)
-        #        output = (int(x_out[0][0]), int(y_out[0][0]))
+        design = self._design_matrix(features)
+        regularization = 1e-4 * np.eye(design.shape[1], dtype=np.float64)
+        regularization[0, 0] = 0.0
+        self.coefficients = np.linalg.solve(design.T @ design + regularization, design.T @ targets)
+        self.feature_count = features.shape[1]
+        return len(filtered)
 
-        # manual linear regression
-        #        x_v = vector[0]
-        #        y_v = vector[1]
-        #        output = (int(self.m_x * x_v + self.t_x), int(self.m_y * y_v + self.t_y))
+    def predict(self, feature_vector, screen_size: tuple[int, int]) -> tuple[int, int]:
+        if not self.is_fitted:
+            raise CalibrationError("Calibration model has not been fitted yet.")
 
-        return output
+        vector = np.asarray(feature_vector, dtype=np.float64)
+        if vector.shape[0] != self.feature_count:
+            raise CalibrationError(
+                f"Expected {self.feature_count} gaze features, received {vector.shape[0]}."
+            )
+
+        prediction = self._design_matrix(vector) @ self.coefficients
+        max_x = max(screen_size[0] - 1, 0)
+        max_y = max(screen_size[1] - 1, 0)
+        return (
+            int(np.clip(round(prediction[0, 0]), 0, max_x)),
+            int(np.clip(round(prediction[0, 1]), 0, max_y)),
+        )
+
+    def save(self, path: str | Path) -> None:
+        if not self.is_fitted:
+            raise CalibrationError("Cannot save an unfitted calibration model.")
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "feature_count": self.feature_count,
+            "coefficients": self.coefficients.tolist(),
+        }
+        path.write_text(json.dumps(payload, indent=2))
+
+    @classmethod
+    def load(cls, path: str | Path) -> "CalibrationModel":
+        payload = json.loads(Path(path).read_text())
+        model = cls()
+        model.feature_count = int(payload["feature_count"])
+        model.coefficients = np.asarray(payload["coefficients"], dtype=np.float64)
+        return model
 
 
-def calibrate(camera, screen, gaze_tracker):
-    N_REQ_VECTORS = 50
-    N_SKIP_VECTORS = 25
+def calibration_targets(screen_size: tuple[int, int], margin_ratio: float = 0.1) -> list[tuple[int, int]]:
+    width, height = int(screen_size[0]), int(screen_size[1])
+    min_x = int(width * margin_ratio)
+    max_x = int(width * (1.0 - margin_ratio))
+    mid_x = width // 2
+    min_y = int(height * margin_ratio)
+    max_y = int(height * (1.0 - margin_ratio))
+    mid_y = height // 2
 
-    screen.clean()
+    return [
+        (mid_x, mid_y),
+        (min_x, min_y),
+        (mid_x, min_y),
+        (max_x, min_y),
+        (min_x, mid_y),
+        (max_x, mid_y),
+        (min_x, max_y),
+        (mid_x, max_y),
+        (max_x, max_y),
+    ]
 
-    calibration = Calibration()
-    calibration_points = calculate_points(screen)
 
-    vectors = collections.defaultdict(list)
+def run_calibration(
+    camera,
+    gaze_tracker,
+    screen,
+    debug_window_name: str = "Gesture Eye Tracking",
+    warmup_frames: int = 10,
+    sample_count: int = 24,
+) -> bool:
+    targets = calibration_targets(screen.size)
+    samples: list[CalibrationSample] = []
+    total_targets = len(targets)
 
-    completed = False
-    enough = 0
-    skip = 0
+    for index, target in enumerate(targets, start=1):
+        warmup = 0
+        collected = 0
 
-    point = calibration_points.pop(0)
+        while collected < sample_count:
+            ok, frame = camera.read()
+            if not ok:
+                return False
 
-    screen.draw(point)
+            frame = cv2.flip(frame, 1)
+            observation = gaze_tracker.observe(frame)
+            ready = observation is not None and observation.average_eye_openness >= gaze_tracker.minimum_eye_openness
+
+            if ready:
+                warmup += 1
+                if warmup > warmup_frames:
+                    samples.append(
+                        CalibrationSample(
+                            target=target,
+                            feature_vector=np.asarray(observation.feature_vector, dtype=np.float64),
+                        )
+                    )
+                    collected += 1
+
+            screen.render(
+                target=target,
+                progress=collected / float(sample_count),
+                title=f"Calibration {index}/{total_targets}",
+                subtitle="Look at the target and keep your head still.",
+            )
+            screen.show()
+
+            debug_frame = gaze_tracker.eye_tracker.decorate_frame(frame.copy(), observation)
+            status = "capturing" if ready else "face/eyes not ready"
+            cv2.putText(
+                debug_frame,
+                f"Calibration {index}/{total_targets} | {collected}/{sample_count} | {status}",
+                (16, 32),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 0) if ready else (0, 0, 255),
+                2,
+            )
+            cv2.imshow(debug_window_name, debug_frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord("q")):
+                screen.close()
+                return False
+
+    kept = gaze_tracker.fit(samples)
+    screen.render_message(
+        title="Calibration complete",
+        subtitle=f"Saved {kept} filtered samples to {gaze_tracker.calibration_path}.",
+    )
     screen.show()
-    while point:
-        screen.draw(point)
-        screen.show()
-
-        _, frame = camera.read()
-
-        start = time.time()
-
-        gaze_tracker.update(frame)
-
-        end = time.time()
-
-        print("TIME: {:.3f} ms".format(end * 1000 - start * 1000))
-
-        cv2.namedWindow("frame")
-        dec_frame = gaze_tracker.eye_tracker.decorate_frame()
-        dec_frame = cv2.resize(dec_frame, (int(FRAME_WIDTH / 2), int(FRAME_HEIGHT / 2)))
-        cv2.moveWindow("frame", 0, 0)
-        cv2.imshow('frame', dec_frame)
-
-        vector = gaze_tracker.get_vector()
-        print("VECTOR: {}\tPOINT: {}".format(vector, point))
-
-        if vector and skip < N_SKIP_VECTORS:
-            skip += 1
-            continue
-
-        if vector:
-            vectors[point].append(vector)
-            enough += 1
-
-        #        print(vectors)
-
-        progress = len(vectors[point]) / N_REQ_VECTORS
-        screen.draw(point, progress=progress)
-        screen.show()
-
-        # netx point condition
-        if enough >= N_REQ_VECTORS and len(calibration_points) > 0:
-            point = calibration_points.pop(0)
-            #            screen.clean()
-            skip = 0
-            enough = 0
-            screen.draw(point)
-            screen.show()
-
-        # end calibration condition
-        if enough >= N_REQ_VECTORS and len(calibration_points) == 0:
-            screen.clean()
-            completed = True
-            break
-
-        k = cv2.waitKey(1) & 0xff
-        if k == 1048603 or k == 27:  # esc to terminate calibration
-            screen.mode = "normal"
-            screen.clean()
-            screen.show()
-            break
-    #        if k == ord('n'): # n to next calibration step
-    ##            screen.clean()
-    #            skip = 0
-    #            enough = 0
-    #            if len(calibration_points) == 0:
-    #                completed = True
-    #                break
-    #            point = calibration_points.pop(0)
-
-    if completed:
-        calibration.update(vectors)
-        gaze_tracker.calibration = calibration
-    screen.mode = "normal"
-
-
-def calculate_points(screen):
-    points = []
-
-    # center
-    p = (int(0.5 * screen.width), int(0.5 * screen.height))
-    points.append(p)
-
-    # top left
-    p = (int(0.05 * screen.width), int(0.05 * screen.height))
-    points.append(p)
-
-    # top
-    p = (int(0.5 * screen.width), int(0.05 * screen.height))
-    points.append(p)
-
-    # top right
-    p = (int(0.95 * screen.width), int(0.05 * screen.height))
-    points.append(p)
-
-    # left
-    p = (int(0.05 * screen.width), int(0.5 * screen.height))
-    points.append(p)
-
-    # right
-    p = (int(0.95 * screen.width), int(0.5 * screen.height))
-    points.append(p)
-
-    # bottom left
-    p = (int(0.05 * screen.width), int(0.95 * screen.height))
-    points.append(p)
-
-    # bottom
-    p = (int(0.5 * screen.width), int(0.95 * screen.height))
-    points.append(p)
-
-    # bottom right
-    p = (int(0.95 * screen.width), int(0.95 * screen.height))
-    points.append(p)
-
-    return points
+    cv2.waitKey(400)
+    screen.close()
+    return True
 
 

@@ -1,479 +1,177 @@
-import os
-import math
-import numpy as np
-import matplotlib.pyplot as plt
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
 import cv2
-from model import Eye
+import mediapipe as mp
+import numpy as np
+from mediapipe.tasks.python import BaseOptions, vision
+
+from model import EyeState, GazeObservation
 
 
-class EyeTracker():
-    def __init__(self):
-        # initialize the opencv classifier for face and eye detection
-        self.face_cascade = cv2.CascadeClassifier(os.path.join('classifiers', 'haarcascade_frontalface_default.xml'))
-        # self.face_cascade = cv2.CascadeClassifier(os.path.join('classifiers', 'haarcascade_frontalface_alt.xml'))
-        # self.eye_cascade = cv2.CascadeClassifier(os.path.join('classifiers', 'haarcascade_eye.xml'))
-        self.eye_cascade = cv2.CascadeClassifier(os.path.join('classifiers', 'haarcascade_eye_tree_eyeglasses.xml'))
+LEFT_EYE_LANDMARKS = [33, 133, 159, 145, 160, 144, 158, 153, 173, 157, 163, 154, 155]
+RIGHT_EYE_LANDMARKS = [362, 263, 386, 374, 387, 373, 385, 380, 398, 384, 381, 382, 390]
+LEFT_IRIS_LANDMARKS = [468, 469, 470, 471, 472]
+RIGHT_IRIS_LANDMARKS = [473, 474, 475, 476, 477]
+NOSE_TIP_INDEX = 1
+LEFT_FACE_INDEX = 234
+RIGHT_FACE_INDEX = 454
+TOP_FACE_INDEX = 10
+BOTTOM_FACE_INDEX = 152
+FACE_LANDMARKER_MODEL = Path(__file__).resolve().parent / "models" / "face_landmarker.task"
 
-        self.frame = None
-        self.frame_gray = None
-        self.left_eye_frame = None
-        self.right_eye_frame = None
 
-        self.left_eye_detected = False
-        self.right_eye_detected = False
+class EyeTracker:
+    def __init__(
+        self,
+        min_detection_confidence: float = 0.5,
+        min_tracking_confidence: float = 0.5,
+    ):
+        if not FACE_LANDMARKER_MODEL.exists():
+            raise FileNotFoundError(
+                f"Missing model asset: {FACE_LANDMARKER_MODEL}. "
+                "Download the vendored MediaPipe task models or restore the repo assets."
+            )
 
-        self.face_bb = None
-        self.left_eye_bb = None
-        self.right_eye_bb = None
+        options = vision.FaceLandmarkerOptions(
+            base_options=BaseOptions(model_asset_path=str(FACE_LANDMARKER_MODEL)),
+            running_mode=vision.RunningMode.VIDEO,
+            num_faces=1,
+            min_face_detection_confidence=min_detection_confidence,
+            min_face_presence_confidence=min_detection_confidence,
+            min_tracking_confidence=min_tracking_confidence,
+        )
+        self._mesh = vision.FaceLandmarker.create_from_options(options)
+        self.last_observation: GazeObservation | None = None
+        self._timestamp_ms = 0
 
-        self.left_pupil_detected = False
-        self.right_pupil_detected = False
-        self.left_pupil = None
-        self.right_pupil = None
-        self.left_pupil_radius = None
-        self.right_pupil_radius = None
+    def _landmark_to_pixel(self, landmark, width: int, height: int) -> tuple[int, int]:
+        x = int(min(max(landmark.x * width, 0), width - 1))
+        y = int(min(max(landmark.y * height, 0), height - 1))
+        return (x, y)
 
-        self.left_iris_detected = False
-        self.right_iris_detected = False
-        self.left_iris = None
-        self.right_iris = None
-        self.left_iris_radius = None
-        self.right_iris_radius = None
+    def _build_eye_state(
+        self,
+        landmarks,
+        width: int,
+        height: int,
+        eye_indices: list[int],
+        iris_indices: list[int],
+    ) -> EyeState:
+        eye_points = [self._landmark_to_pixel(landmarks[index], width, height) for index in eye_indices]
+        iris_points = np.asarray(
+            [self._landmark_to_pixel(landmarks[index], width, height) for index in iris_indices],
+            dtype=np.float64,
+        )
+        iris_center = iris_points.mean(axis=0)
 
-        self.left_purkinje = None
-        self.right_purkinje = None
+        xs = [point[0] for point in eye_points]
+        ys = [point[1] for point in eye_points]
+        min_x, max_x = min(xs), max(xs)
+        min_y, max_y = min(ys), max(ys)
+        box_width = max(max_x - min_x, 1)
+        box_height = max(max_y - min_y, 1)
 
-    def update(self, frame):
-        self.frame = frame
-        self._analyze()
+        left_corner = np.asarray(eye_points[0], dtype=np.float64)
+        right_corner = np.asarray(eye_points[1], dtype=np.float64)
+        top_lid = np.asarray(eye_points[2], dtype=np.float64)
+        bottom_lid = np.asarray(eye_points[3], dtype=np.float64)
+        openness = float(np.linalg.norm(top_lid - bottom_lid) / max(np.linalg.norm(left_corner - right_corner), 1.0))
 
-    def _analyze(self):
-        self.frame_gray = cv2.cvtColor(self.frame, cv2.COLOR_BGR2GRAY)
+        return EyeState(
+            center=(int(round(iris_center[0])), int(round(iris_center[1]))),
+            bbox=(min_x, min_y, box_width, box_height),
+            openness=openness,
+            ratio=(
+                float((iris_center[0] - min_x) / box_width),
+                float((iris_center[1] - min_y) / box_height),
+            ),
+        )
 
-        self._extract_face()
-        self._extract_eyes()
-        if self.left_eye_detected:
-            self._extract_pupil("left")
-            self._extract_iris("left")
-            if self.left_iris_detected and self.left_pupil_detected:
-                self._extract_purkinje("left")
+    def process(self, frame) -> GazeObservation | None:
+        height, width = frame.shape[:2]
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        now_ms = int(time.monotonic() * 1000)
+        self._timestamp_ms = max(self._timestamp_ms + 1, now_ms)
+        result = self._mesh.detect_for_video(image, self._timestamp_ms)
 
-        if self.right_eye_detected:
-            self._extract_pupil("right")
-            self._extract_iris("right")
-            if self.right_iris_detected and self.right_pupil_detected:
-                self._extract_purkinje("right")
+        if not result.face_landmarks:
+            self.last_observation = None
+            return None
 
-    def left_eye(self):
-        if self.left_eye_detected:
-            return Eye(self.left_eye_frame.copy(), "left", self.left_pupil, self.left_pupil_radius,
-                       self.left_iris_radius, self.left_purkinje)
-        return None
+        landmarks = result.face_landmarks[0]
+        left_eye = self._build_eye_state(landmarks, width, height, LEFT_EYE_LANDMARKS, LEFT_IRIS_LANDMARKS)
+        right_eye = self._build_eye_state(landmarks, width, height, RIGHT_EYE_LANDMARKS, RIGHT_IRIS_LANDMARKS)
 
-    def right_eye(self):
-        if self.right_eye_detected:
-            return Eye(self.right_eye_frame.copy(), "right", self.right_pupil, self.right_pupil_radius,
-                       self.right_iris_radius, self.right_purkinje)
-        return None
+        nose_tip = self._landmark_to_pixel(landmarks[NOSE_TIP_INDEX], width, height)
+        left_face = self._landmark_to_pixel(landmarks[LEFT_FACE_INDEX], width, height)
+        right_face = self._landmark_to_pixel(landmarks[RIGHT_FACE_INDEX], width, height)
+        top_face = self._landmark_to_pixel(landmarks[TOP_FACE_INDEX], width, height)
+        bottom_face = self._landmark_to_pixel(landmarks[BOTTOM_FACE_INDEX], width, height)
 
-    def decorate_frame(self):
-        frame = self.frame.copy()
+        face_width = max(abs(right_face[0] - left_face[0]), 1)
+        face_height = max(abs(bottom_face[1] - top_face[1]), 1)
+        face_center = (
+            int(round((left_face[0] + right_face[0]) / 2)),
+            int(round((top_face[1] + bottom_face[1]) / 2)),
+        )
+        head_offset_x = float((nose_tip[0] - face_center[0]) / face_width)
+        head_offset_y = float((nose_tip[1] - face_center[1]) / face_height)
 
-        # draw the face bounding box
-        x, y, w, h = self.face_bb
-        cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 255, 0), 2)
+        average_eye_openness = float((left_eye.openness + right_eye.openness) / 2.0)
+        average_eye_ratio_x = float((left_eye.ratio[0] + right_eye.ratio[0]) / 2.0)
+        average_eye_ratio_y = float((left_eye.ratio[1] + right_eye.ratio[1]) / 2.0)
 
-        if self.left_eye_bb:
-            ##            eye_frame = frame[self.left_eye_bb[1]:self.left_eye_bb[1]+self.left_eye_bb[3], self.left_eye_bb[0]:self.left_eye_bb[0]+self.left_eye_bb[2]]
-            ##            cv2.imwrite("images/eye_frame_start.png", eye_frame)
+        feature_vector = np.asarray(
+            [
+                average_eye_ratio_x,
+                average_eye_ratio_y,
+                left_eye.ratio[0],
+                left_eye.ratio[1],
+                right_eye.ratio[0],
+                right_eye.ratio[1],
+                head_offset_x,
+                head_offset_y,
+                face_width / float(width),
+                face_height / float(height),
+                left_eye.openness,
+                right_eye.openness,
+            ],
+            dtype=np.float64,
+        )
 
-            if self.left_pupil and self.left_pupil_radius:
-                # draw the left pupil
-                x, y = self.left_pupil
-                x += self.left_eye_bb[0]
-                y += self.left_eye_bb[1]
-                r = self.left_pupil_radius
-                cv2.circle(frame, (x, y), 5, (0, 0, 255), -1)
-            #                cv2.circle(frame, (x, y), r, (0, 255, 0), 1)
+        self.last_observation = GazeObservation(
+            feature_vector=feature_vector,
+            left_eye=left_eye,
+            right_eye=right_eye,
+            nose_tip=nose_tip,
+            face_center=face_center,
+            face_size=(float(face_width), float(face_height)),
+            average_eye_openness=average_eye_openness,
+        )
+        return self.last_observation
 
-            ##                eye_frame = frame[self.left_eye_bb[1]:self.left_eye_bb[1]+self.left_eye_bb[3], self.left_eye_bb[0]:self.left_eye_bb[0]+self.left_eye_bb[2]]
-            ##                cv2.imwrite("images/pupil_detection_04_eye_frame.png", eye_frame)
+    def update(self, frame) -> GazeObservation | None:
+        return self.process(frame)
 
-            if self.left_iris and self.left_iris_radius:
-                # draw the left iris
-                x, y = self.left_iris
-                x += self.left_eye_bb[0]
-                y += self.left_eye_bb[1]
-                r = self.left_iris_radius
-                #                cv2.circle(frame, (x, y), 2, (0, 0, 255), -1)
-                cv2.circle(frame, (x, y), r, (0, 255, 0), 1)
+    def decorate_frame(self, frame, observation: GazeObservation | None = None):
+        observation = observation or self.last_observation
+        if observation is None:
+            return frame
 
-            ##                eye_frame = frame[self.left_eye_bb[1]:self.left_eye_bb[1]+self.left_eye_bb[3], self.left_eye_bb[0]:self.left_eye_bb[0]+self.left_eye_bb[2]]
-            ##                cv2.imwrite("images/iris_detection_03_eye_frame.png", eye_frame)
+        for eye in (observation.left_eye, observation.right_eye):
+            x, y, w, h = eye.bbox
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 200, 0), 2)
+            cv2.circle(frame, eye.center, 3, (0, 255, 0), -1)
 
-            if self.left_purkinje:
-                # draw the left purkinje
-                x, y = self.left_purkinje
-                x += self.left_eye_bb[0]
-                y += self.left_eye_bb[1]
-                cv2.circle(frame, (x, y), 5, (255, 0, 0), -1)
-            ##                eye_frame = frame[self.left_eye_bb[1]:self.left_eye_bb[1]+self.left_eye_bb[3], self.left_eye_bb[0]:self.left_eye_bb[0]+self.left_eye_bb[2]]
-            ##                cv2.imwrite("images/purkinje_detection_03_eye_frame.png", eye_frame)
-
-            ##            eye_frame = frame[self.left_eye_bb[1]:self.left_eye_bb[1]+self.left_eye_bb[3], self.left_eye_bb[0]:self.left_eye_bb[0]+self.left_eye_bb[2]]
-            ##            cv2.imwrite("images/eye_frame_end.png", eye_frame)
-
-            # draw the left eye bounding box
-            x, y, w, h = self.left_eye_bb
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 255), 2)
-
-        if self.right_eye_bb:
-
-            if self.right_pupil and self.right_pupil_radius:
-                # draw the right pupil center
-                x, y = self.right_pupil
-                x += self.right_eye_bb[0]
-                y += self.right_eye_bb[1]
-                r = self.right_pupil_radius
-                cv2.circle(frame, (x, y), 5, (0, 0, 255), -1)
-            #                cv2.circle(frame, (x, y), r, (0, 255, 0), 1)
-
-            if self.right_iris and self.right_iris_radius:
-                # draw the right iris
-                x, y = self.right_iris
-                x += self.right_eye_bb[0]
-                y += self.right_eye_bb[1]
-                r = self.right_iris_radius
-                #                cv2.circle(frame, (x, y), 2, (0, 0, 255), -1)
-                cv2.circle(frame, (x, y), r, (0, 255, 0), 1)
-
-            if self.right_purkinje:
-                # draw the right purkinje
-                x, y = self.right_purkinje
-                x += self.right_eye_bb[0]
-                y += self.right_eye_bb[1]
-                cv2.circle(frame, (x, y), 5, (255, 0, 0), -1)
-
-            # draw the right eye bounding box
-            x, y, w, h = self.right_eye_bb
-            cv2.rectangle(frame, (x, y), (x + w, y + h), (255, 0, 255), 2)
-
+        cv2.circle(frame, observation.nose_tip, 4, (0, 0, 255), -1)
+        cv2.circle(frame, observation.face_center, 4, (255, 0, 255), -1)
+        cv2.line(frame, observation.face_center, observation.nose_tip, (255, 0, 255), 2)
         return frame
 
-    def _extract_face(self):
-
-        """
-        Extract the box of the face ROI image as opencv format (x, y, w, h) from the current frame
-        """
-        frame_gray = cv2.GaussianBlur(self.frame_gray, (7, 7), 0)
-        #        frame_gray = cv2.medianBlur(frame_gray, 7)
-
-        #        faces = self.face_cascade.detectMultiScale(frame_gray)
-        faces = self.face_cascade.detectMultiScale(frame_gray, 1.3, 5)
-
-        # detect the best face on the image based on ROI size
-        if len(faces) > 1:
-            temp = (0, 0, 0, 0)
-            for f in faces:
-                if f[2] * f[3] > temp[2] * temp[3]:
-                    temp = f
-            best_face = (temp[0], temp[1], temp[2], temp[3])
-        elif len(faces) == 1:
-            face = faces[0]
-            best_face = (face[0], face[1], face[2], face[3])
-        else:
-            # if no face is detected return all image as face ROI
-            image_height = self.frame_gray.shape[0]
-            image_width = self.frame_gray.shape[1]
-            best_face = (0, 0, image_width, image_height)
-
-        self.face_bb = best_face
-
-    def _extract_eyes(self):
-
-        """
-        Extract the box of the eyes ROI image as opencv format (x, y, w, h) from the current frame
-        """
-        self.left_eye_detected = False
-        self.right_eye_detected = False
-        self.left_eye_bb = None
-        self.right_eye_bb = None
-
-        x, y, w, h = self.face_bb
-
-        face_frame_gray = self.frame_gray[y:y + h, x:x + w]
-        face_frame_gray = cv2.GaussianBlur(face_frame_gray, (7, 7), 0)
-        #        face_frame_gray = cv2.medianBlur(face_frame_gray, 7)
-
-        #        eyes = self.eye_cascade.detectMultiScale(face_frame_gray)
-        eyes = self.eye_cascade.detectMultiScale(face_frame_gray, 1.3, 5)
-
-        for (ex, ey, ew, eh) in eyes:
-            # do not consider false eyes detected at the bottom of the face
-            if ey > 0.5 * h:
-                continue
-
-            remove_eyebrows = np.array([0, int(0.25 * eh), int(0), int(-0.25 * eh)])
-            eye_center = ex + ew / 2
-            if eye_center > w * 0.5:
-                self.left_eye_detected = True
-                left_bb = np.array([ex, ey, ew, eh])
-                left_bb += remove_eyebrows
-                self.left_eye_bb = (x + left_bb[0], y + left_bb[1], left_bb[2], left_bb[3])
-                self.left_eye_frame = self.frame[self.left_eye_bb[1]:self.left_eye_bb[1] + self.left_eye_bb[3],
-                                      self.left_eye_bb[0]:self.left_eye_bb[0] + self.left_eye_bb[2]]
-
-            else:
-                self.right_eye_detected = True
-                right_bb = np.array([ex, ey, ew, eh])
-                right_bb += remove_eyebrows
-                self.right_eye_bb = (x + right_bb[0], y + right_bb[1], right_bb[2], right_bb[3])
-                self.right_eye_frame = self.frame[self.right_eye_bb[1]:self.right_eye_bb[1] + self.right_eye_bb[3],
-                                       self.right_eye_bb[0]:self.right_eye_bb[0] + self.right_eye_bb[2]]
-
-    def _extract_pupil(self, position):
-
-        """
-        Extract from the eye frame the coordinates of the center of the pupil (x, y)
-        w.r.t the eye frame and the pupil radius in pixels
-        """
-
-        self.left_pupil_detected = False
-        self.right_pupil_detected = False
-        pupil_center = None
-        pupil_radius = None
-
-        if position == "left":
-            eye_frame_gray = self.frame_gray[self.left_eye_bb[1]:self.left_eye_bb[1] + self.left_eye_bb[3],
-                             self.left_eye_bb[0]:self.left_eye_bb[0] + self.left_eye_bb[2]]
-
-        if position == "right":
-            eye_frame_gray = self.frame_gray[self.right_eye_bb[1]:self.right_eye_bb[1] + self.right_eye_bb[3],
-                             self.right_eye_bb[0]:self.right_eye_bb[0] + self.right_eye_bb[2]]
-
-        ##        if position == "left":
-        ##            cv2.imwrite("images/pupil_detection_00_eye_frame_gray.png", eye_frame_gray)
-
-        #        eye_frame_gray = cv2.GaussianBlur(eye_frame_gray, (7, 7), 0)
-        #        eye_frame_gray = cv2.medianBlur(eye_frame_gray, 7)
-        eye_frame_gray = cv2.equalizeHist(eye_frame_gray)
-
-        ##        if position == "left":
-        ##            cv2.imwrite("images/pupil_detection_01_equalized_hist.png", eye_frame_gray)
-
-        #        threshold = 2
-        threshold = cv2.getTrackbarPos('threshold', 'frame')
-
-        _, eye_frame_th = cv2.threshold(eye_frame_gray, threshold, 255, cv2.THRESH_BINARY)
-
-        ##        if position == "left":
-        ##            cv2.imwrite("images/pupil_detection_02_threshold.png", eye_frame_th)
-
-        eye_frame_th = cv2.erode(eye_frame_th, None, iterations=2)
-        eye_frame_th = cv2.dilate(eye_frame_th, None, iterations=4)
-
-        eye_frame_th = cv2.medianBlur(eye_frame_th, 7)
-
-        ##        if position == "left":
-        ##            cv2.imwrite("images/pupil_detection_03_medianBlur.png", eye_frame_th)
-
-        contours, _ = cv2.findContours(eye_frame_th, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-        contours = sorted(contours, key=lambda x: cv2.contourArea(x))
-
-        for cnt in contours:
-
-            cnt = cv2.convexHull(cnt)
-            area = cv2.contourArea(cnt)
-            if area == 0:
-                continue
-            circumference = cv2.arcLength(cnt, True)
-            circularity = circumference ** 2 / (4 * math.pi * area)
-
-            #            if circularity < 0.5 and circularity > 1.5:
-            #                continue
-
-            #            (x,y), radius = cv2.minEnclosingCircle(cnt)
-            #            pupil_center = (int(x),int(y))
-
-            radius = circumference / (2 * math.pi)
-            pupil_radius = int(radius)
-            m = cv2.moments(cnt)
-            if m['m00'] != 0:
-                pupil_center = (int(m['m10'] / m['m00']), int(m['m01'] / m['m00']))
-                break
-
-        if position == "left":
-            if pupil_center != None and pupil_radius != None:
-                self.left_pupil_detected = True
-            self.left_pupil = pupil_center
-            self.left_pupil_radius = pupil_radius
-
-        if position == "right":
-            if pupil_center != None and pupil_radius != None:
-                self.right_pupil_detected = True
-            self.right_pupil = pupil_center
-            self.right_pupil_radius = pupil_radius
-
-    # self.right_eye_frame = cv2.drawKeypoints(self.right_eye_frame, keypoints, self.right_eye_frame, (0, 0, 255),
-    # cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
-
-    def _extract_iris(self, position):
-        """
-        Extract from the eye frame the coordinates of the center of iris (x, y)
-        w.r.t the eye frame and the iris radius in pixels
-        """
-        self.left_iris_detected = False
-        self.right_iris_detected = False
-        iris_center = None
-        iris_radius = None
-
-        if position == "left":
-            eye_frame_gray = self.frame_gray[self.left_eye_bb[1]:self.left_eye_bb[1] + self.left_eye_bb[3],
-                             self.left_eye_bb[0]:self.left_eye_bb[0] + self.left_eye_bb[2]]
-
-        if position == "right":
-            eye_frame_gray = self.frame_gray[self.right_eye_bb[1]:self.right_eye_bb[1] + self.right_eye_bb[3],
-                             self.right_eye_bb[0]:self.right_eye_bb[0] + self.right_eye_bb[2]]
-        ##        if position == "left":
-        ##            cv2.imwrite("images/iris_detection_00_eye_frame_gray.png", eye_frame_gray)
-
-        eye_frame_gray = cv2.equalizeHist(eye_frame_gray)
-        eye_frame_gray = cv2.medianBlur(eye_frame_gray, 7)
-        eye_frame_gray = cv2.GaussianBlur(eye_frame_gray, (11, 11), 0)
-
-        ##        if position == "left":
-        ##            cv2.imwrite("images/iris_detection_01_equalized_smoothing.png", eye_frame_gray)
-
-        frame_height = np.size(eye_frame_gray, 0)
-        frame_width = np.size(eye_frame_gray, 1)
-
-        edged = cv2.Canny(eye_frame_gray, 100, 200)
-
-        ##        if position == "left":
-        ##            cv2.imwrite("images/iris_detection_02_canny.png", edged)
-
-        circles = cv2.HoughCircles(eye_frame_gray, cv2.HOUGH_GRADIENT, 1, int(frame_width), param1=100, param2=5,
-                                   minRadius=5, maxRadius=int(frame_width / 4))
-
-        #        print("Circles:", circles)
-
-        if circles is not None:
-            circles = np.uint16(np.around(circles))
-            c = circles[0][0]
-            iris_center = (c[0], c[1])
-            iris_radius = c[2]
-
-        if position == "left":
-            if iris_center != None and iris_radius != None:
-                self.left_iris_detected = True
-            self.left_iris = iris_center
-            self.left_iris_radius = iris_radius
-
-        if position == "right":
-            if iris_center != None and iris_radius != None:
-                self.right_iris_detected = True
-            self.right_iris = iris_center
-            self.right_iris_radius = iris_radius
-
-    def _extract_purkinje(self, position):
-        """
-        Extract from the eye frame the coordinates of the purkinje image (x, y)
-        w.r.t the eye frame and the pupil radius in pixels
-        """
-
-        purkinje = None
-
-        if position == "left":
-            #            iris_center = self.left_iris
-            pupil_center = self.left_pupil
-            iris_radius = self.left_iris_radius
-            eye_frame_gray = self.frame_gray[self.left_eye_bb[1]:self.left_eye_bb[1] + self.left_eye_bb[3],
-                             self.left_eye_bb[0]:self.left_eye_bb[0] + self.left_eye_bb[2]]
-
-        if position == "right":
-            #            iris_center = self.right_iris
-            pupil_center = self.right_pupil
-            iris_radius = self.right_iris_radius
-            eye_frame_gray = self.frame_gray[self.right_eye_bb[1]:self.right_eye_bb[1] + self.right_eye_bb[3],
-                             self.right_eye_bb[0]:self.right_eye_bb[0] + self.right_eye_bb[2]]
-
-        x = pupil_center[0] - iris_radius
-        y = pupil_center[1] - iris_radius
-        w = iris_radius * 2
-        h = iris_radius * 2
-        iris_frame_gray = eye_frame_gray[y:y + h, x:x + w]
-        if iris_frame_gray.shape[0] == 0 or iris_frame_gray.shape[1] == 0:
-            return
-            x = 0
-            y = 0
-            iris_frame_gray = eye_frame_gray
-            if position == "left":
-                self.left_purkinje = purkinje
-
-            if position == "right":
-                self.right_purkinje = purkinje
-
-        ##        if position == "left":
-        ##            cv2.imwrite("images/purkinje_detection_00_iris_frame_gray.png", iris_frame_gray)
-
-        iris_frame_gray = cv2.equalizeHist(iris_frame_gray)
-        #        iris_frame_gray = cv2.medianBlur(iris_frame_gray, 7)
-        #        iris_frame_gray = cv2.GaussianBlur(iris_frame_gray, (7, 7), 0)
-
-        ##        if position == "left":
-        ##            cv2.imwrite("images/purkinje_detection_01_equalized.png", iris_frame_gray)
-
-        # Iterative global thresholding
-        th = 255
-        count = 0
-        founded = False
-        while not founded and th > 127:
-            _, th_global = cv2.threshold(iris_frame_gray, th, 255, cv2.THRESH_BINARY)
-            count = np.count_nonzero(th_global)
-            th -= 1
-            if count <= 0:
-                continue
-
-            contours, _ = cv2.findContours(th_global, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-            contours = sorted(contours, key=lambda x: cv2.contourArea(x))
-            all_purkinjes = []
-            for cnt in contours:
-                cnt = cv2.convexHull(cnt)
-                m = cv2.moments(cnt)
-                if m['m00'] != 0:
-                    purkinje = (x + int(m['m10'] / m['m00']), y + int(m['m01'] / m['m00']))
-
-                    square_dist = pow(purkinje[0] - pupil_center[0], 2) + pow(purkinje[1] - pupil_center[1], 2)
-                    all_purkinjes.append([purkinje, square_dist])
-            if all_purkinjes:
-                all_purkinjes.sort(key=lambda x: x[1])
-                for p in all_purkinjes:
-                    purkinje = p[0]
-                    if pow(purkinje[0] - pupil_center[0], 2) + pow(purkinje[1] - pupil_center[1], 2) < pow(iris_radius,
-                                                                                                           2):
-                        founded = True
-                        break
-
-        ##        if position == "left":
-        ##            cv2.imwrite("images/purkinje_detection_02_iter_threshold.png", th_global)
-
-        if position == "left":
-            self.left_purkinje = purkinje
-
-        if position == "right":
-            self.right_purkinje = purkinje
-
-
-class Eye:
-
-    def __init__(self, frame, position, pupil_center, pupil_radius, iris_radius, purkinje):
-        self.frame = frame
-        self.position = position
-        self.pupil_center = pupil_center
-        self.pupil_radius = pupil_radius
-        self.iris_radius = iris_radius
-        self.purkinje = purkinje
-
-    def __str__(self):
-        return "Eye: {}\n\tPupil center: {}\n\tPupil radius: {}\n\tIris radius: {}\n\tPurkinje: {}\n".format(self.position, self.pupil_center, self.pupil_radius, self.iris_radius, self.purkinje)
+    def close(self) -> None:
+        self._mesh.close()
 

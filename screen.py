@@ -1,91 +1,118 @@
-import numpy as np
+from __future__ import annotations
+
 import cv2
-import pyautogui
+import numpy as np
 
-RES_SCREEN = pyautogui.size()  # RES_SCREEN[0] -> width
-
-
-# RES_SCREEN[1] -> heigth
 
 class Screen:
+    def __init__(
+        self,
+        screen_size: tuple[int, int] = (1280, 720),
+        window_name: str = "Calibration",
+        fullscreen: bool = True,
+    ):
+        self.width = int(screen_size[0])
+        self.height = int(screen_size[1])
+        self.window_name = window_name
+        self.fullscreen = fullscreen
+        self.canvas = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        self._initialized = False
 
-    def __init__(self, width=1280, height=720):
-        self.width = width
-        self.height = height
-        self.pointer = (0, 0)
-        self.mode = "normal"
-        self.screen = np.ones((self.height, self.width, 3))
-        self.clean()
+    @property
+    def size(self) -> tuple[int, int]:
+        return (self.width, self.height)
 
-    def refresh(self):
-        self.clean()
-        self.draw_pointer()
-        self.show()
+    def _ensure_window(self) -> None:
+        if self._initialized:
+            return
+        cv2.namedWindow(self.window_name, cv2.WINDOW_NORMAL)
+        if self.fullscreen:
+            try:
+                cv2.setWindowProperty(
+                    self.window_name,
+                    cv2.WND_PROP_FULLSCREEN,
+                    cv2.WINDOW_FULLSCREEN,
+                )
+            except cv2.error:
+                pass
+        self._initialized = True
 
-    def update(self, gaze):
-        self.pointer = gaze
+    def _draw_text(self, lines: list[str], start_y: int) -> None:
+        for index, line in enumerate(lines):
+            cv2.putText(
+                self.canvas,
+                line,
+                (48, start_y + index * 36),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (220, 220, 220),
+                2,
+            )
 
-    def clean(self):
-        self.screen = np.ones((self.height, self.width, 3))
-        self.print_instructions()
+    def render(
+        self,
+        target: tuple[int, int],
+        progress: float = 0.0,
+        title: str = "Calibration",
+        subtitle: str = "Look at the target.",
+    ) -> None:
+        self.canvas = np.full((self.height, self.width, 3), 18, dtype=np.uint8)
+        x, y = target
+        radius = max(int(min(self.width, self.height) * 0.015), 10)
 
-    def draw(self, point, progress=0):
-        x, y = point
-        if progress == 1.0:
-            cv2.circle(self.screen, (x, y), 5, (0, 255, 0), -1)
-        else:
-            cv2.circle(self.screen, (x, y), 5, (0, 0, 0), -1)
+        cv2.circle(self.canvas, (x, y), radius, (255, 255, 255), -1)
+        cv2.circle(self.canvas, (x, y), radius + 14, (80, 180, 80), 2)
 
-        if progress > 0:
-            # Ellipse parameters
-            radius = 7
-            axes = (radius, radius)
-            angle = 0
-            start_angle = 0
-            end_angle = 360 * progress
-            cv2.ellipse(self.screen, (x, y), axes, angle, start_angle, end_angle, (0, 255, 0), 2)
+        if progress > 0.0:
+            cv2.ellipse(
+                self.canvas,
+                (x, y),
+                (radius + 20, radius + 20),
+                0,
+                0,
+                360 * min(max(progress, 0.0), 1.0),
+                (0, 255, 0),
+                4,
+            )
 
-    def draw_center(self):
-        x, y = (int(0.5 * self.width), int(0.5 * self.height))
-        cv2.circle(self.screen, (x, y), 5, (0, 0, 0), -1)
+        self._draw_text(
+            [
+                title,
+                subtitle,
+                "Press ESC or q to cancel calibration.",
+            ],
+            start_y=72,
+        )
 
-    def draw_pointer(self):
-        x, y = self.pointer
-        cv2.circle(self.screen, (x, y), 5, (0, 255, 0), -1)
+    def render_message(self, title: str, subtitle: str = "") -> None:
+        self.canvas = np.full((self.height, self.width, 3), 18, dtype=np.uint8)
+        lines = [title]
+        if subtitle:
+            lines.append(subtitle)
 
-    def print_instructions(self):
-        x, y0, dy = int(0.03 * self.width), int(0.8 * self.height), 35
+        text_sizes = [cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 1.1, 2)[0] for line in lines]
+        total_height = sum(size[1] for size in text_sizes) + 40 * max(len(lines) - 1, 0)
+        current_y = (self.height - total_height) // 2
 
-        if self.mode == "normal":
-            instructions = "Press:\nESC to quit\nc to start calibration"
-        if self.mode == "calibration":
-            #            instructions = "Press:\nESC to terminate\nn to next calibration step"
-            instructions = "Press:\nESC to terminate calibration"
+        for line, size in zip(lines, text_sizes):
+            x = (self.width - size[0]) // 2
+            y = current_y + size[1]
+            cv2.putText(
+                self.canvas,
+                line,
+                (x, y),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.1,
+                (255, 255, 255),
+                2,
+            )
+            current_y += size[1] + 40
 
-        for i, line in enumerate(instructions.split('\n')):
-            y = y0 + i * dy
-            cv2.putText(img=self.screen, text=line, org=(x, y), fontFace=cv2.FONT_HERSHEY_SIMPLEX, fontScale=0.8,
-                        color=(0, 0, 0), thickness=2)
+    def show(self) -> None:
+        self._ensure_window()
+        cv2.imshow(self.window_name, self.canvas)
 
-    def print_message(self, msg):
-
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        fs = 2
-        th = 3
-
-        for i, line in enumerate(msg.split('\n')):
-            textsize = cv2.getTextSize(line, font, fs, th)[0]
-            x = (self.width - textsize[0]) // 2
-            y0, dy = (self.height + textsize[1]) // 2, textsize[1] + 30
-
-            y = y0 + i * dy
-            cv2.putText(img=self.screen, text=line, org=(x, y), fontFace=font, fontScale=fs, color=(0, 0, 0),
-                        thickness=th)
-
-    def show(self):
-        cv2.namedWindow("screen")
-        cv2.moveWindow("screen", int(RES_SCREEN[0] / 2 - self.width / 2), 0)
-
-        #        cv2.namedWindow("screen", cv2.WND_PROP_FULLSCREEN)
-        #        cv2.setWindowProperty("screen",cv2.WND_PROP_FULLSCREEN,cv2.WINDOW_FULLSCREEN)
-        cv2.imshow("screen", self.screen)
+    def close(self) -> None:
+        if self._initialized:
+            cv2.destroyWindow(self.window_name)
+            self._initialized = False
