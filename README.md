@@ -1,3 +1,5 @@
+The old repo was written in 2023 (pre-LLMs) and was a mess. Most of the functionality was there but not properly tested, and not working very well. Got the urge to revamp it recently w/ Codex.
+
 # gestureEyeTracking
 
 This repo is now a single desktop prototype for hands-free control with no frontend. It uses:
@@ -6,8 +8,6 @@ This repo is now a single desktop prototype for hands-free control with no front
 - A 9-point on-screen calibration step to map those features to screen coordinates
 - MediaPipe Hand Landmarker for click, drag, and scroll gestures
 - `pyautogui` for optional OS mouse control
-
-The old repo state was a broken flattening of unrelated eye-tracking and virtual-mouse projects. The missing Haar/Purkinje assets, deleted `model.py`, tracked bytecode, and auto-running scripts have been replaced with one coherent runtime.
 
 ## What Works
 
